@@ -40,7 +40,7 @@ const LS = {
 const COLORS = ['#ef4444', '#3b82f6', '#22c55e', '#f59e0b', '#a855f7', '#ec4899', '#14b8a6', '#f97316', '#6366f1', '#84cc16'];
 
 // defaults; replaced by the server's values on join
-let CFG = { r0: 14, rmin: 5.5, pr: 0.65, dashCd: 1.5, grace: 8 };
+let CFG = { r0: 14, rmin: 5.5, pr: 0.65, dashCd: 1.5, grace: 8, acc: 22, friction: 3, dashSpeed: 15, dashTime: 0.28 };
 
 function normalizeServerUrl(v) {
   let s = String(v || '').trim();
@@ -345,6 +345,7 @@ function stickMove(e) {
     stickX = 0;
     stickY = 0;
   }
+  sendInput(false);
 }
 function stickEnd() {
   stickPointer = -1;
@@ -395,11 +396,70 @@ zone.addEventListener('pointercancel', (e) => {
 window.addEventListener('resize', layoutStick);
 window.addEventListener('orientationchange', () => setTimeout(layoutStick, 250));
 
+// Client-side prediction: the local player moves instantly using the same rules as the server,
+// then is gently pulled toward the server's authoritative state.
+const pred = { on: false, x: 0, z: 0, vx: 0, vz: 0, a: 0, dashT: 0, dashCd: 0 };
+
+function predictStep(dt, me, since) {
+  if (!(inGame && phase === 'play' && me && me.st === 1)) {
+    pred.on = false;
+    return;
+  }
+  if (!pred.on) {
+    pred.on = true;
+    pred.x = me.x;
+    pred.z = me.z;
+    pred.vx = me.vx;
+    pred.vz = me.vz;
+    pred.a = me.a;
+    pred.dashT = 0;
+    pred.dashCd = me.cd;
+  }
+  const v = currentVector();
+  pred.dashCd = Math.max(0, pred.dashCd - dt);
+  pred.dashT = Math.max(0, pred.dashT - dt);
+  pred.vx += v.dx * CFG.acc * dt;
+  pred.vz += v.dz * CFG.acc * dt;
+  const k = Math.exp(-CFG.friction * dt);
+  pred.vx *= k;
+  pred.vz *= k;
+  if (v.dx * v.dx + v.dz * v.dz > 0.02) pred.a = Math.atan2(v.dx, v.dz);
+  pred.x += pred.vx * dt;
+  pred.z += pred.vz * dt;
+
+  // where the server probably is right now
+  const lat = pingMs / 2000 + since;
+  const ex = me.tx + me.vx * lat;
+  const ez = me.tz + me.vz * lat;
+  const err = Math.hypot(ex - pred.x, ez - pred.z);
+  if (err > 3) {
+    pred.x = ex;
+    pred.z = ez;
+    pred.vx = me.vx;
+    pred.vz = me.vz;
+  } else {
+    const gain = err > 0.8 ? 10 : 3;
+    const c = 1 - Math.exp(-gain * dt);
+    pred.x += (ex - pred.x) * c;
+    pred.z += (ez - pred.z) * c;
+    const cv = 1 - Math.exp(-gain * 0.6 * dt);
+    pred.vx += (me.vx - pred.vx) * cv;
+    pred.vz += (me.vz - pred.vz) * cv;
+  }
+}
+
 function doDash() {
   if (!inGame) return;
   dashCounter = (dashCounter + 1) % 1000000;
   sendInput(true);
   buzz(15);
+  if (pred.on && pred.dashCd <= 0) {
+    pred.vx = Math.sin(pred.a) * CFG.dashSpeed;
+    pred.vz = Math.cos(pred.a) * CFG.dashSpeed;
+    pred.dashT = CFG.dashTime;
+    pred.dashCd = CFG.dashCd;
+    sfx.dash();
+  }
 }
 $('dash').addEventListener('pointerdown', (e) => {
   e.preventDefault();
@@ -443,10 +503,11 @@ function sendInput(force) {
   const same =
     Math.abs(v.dx - lastSent.dx) < 0.02 && Math.abs(v.dz - lastSent.dz) < 0.02 && dashCounter === lastSent.d && now - lastSent.t < 250;
   if (same && !force) return;
+  if (!force && now - lastSent.t < 25) return;
   lastSent = { dx: v.dx, dz: v.dz, d: dashCounter, t: now };
   ws.send(JSON.stringify({ t: 'in', dx: Math.round(v.dx * 100) / 100, dz: Math.round(v.dz * 100) / 100, d: dashCounter }));
 }
-setInterval(() => sendInput(false), 50);
+setInterval(() => sendInput(false), 33);
 setInterval(() => {
   if (ws && ws.readyState === 1 && inGame) ws.send(JSON.stringify({ t: 'ping', c: Date.now() }));
 }, 2000);
@@ -521,6 +582,7 @@ function updateHud() {
   setText($('msg'), txt);
   setText($('sub'), sub);
   setText($('ping'), pingMs ? `${pingMs} ms` : '');
+  $('ping').style.color = pingMs < 80 ? '#34d399' : pingMs < 150 ? '#fbbf24' : '#fb7185';
 }
 
 // ───────────────────────── networking ─────────────────────────
@@ -597,6 +659,12 @@ function connect(mode, code) {
   const token = ++connectToken;
   const url = serverUrl();
   const MAX_TRIES = 6;
+  // Inside the installed app there is no local server, so "localhost" means nobody set an address yet.
+  if (location.protocol === 'https:' && /^wss:\/\/localhost(:|$)/i.test(url)) {
+    setStatus('No server address yet. Tap "Server" below and enter your server (wss://...).', true);
+    setButtons(false);
+    return;
+  }
 
   const attempt = (n) => {
     if (token !== connectToken) return;
@@ -848,13 +916,21 @@ scene.onBeforeRenderObservable.add(() => {
   const sx = canvas.clientWidth / Math.max(1, engine.getRenderWidth());
   const sy = canvas.clientHeight / Math.max(1, engine.getRenderHeight());
 
+  const meV = views.get(myId);
+  predictStep(dt, meV, since);
+
   for (const v of views.values()) {
     const px = v.tx + v.vx * since;
     const pz = v.tz + v.vz * since;
     v.x += (px - v.x) * kp;
     v.z += (pz - v.z) * kp;
     v.y += (v.ty - v.y) * kp;
-    let da = v.ta - v.a;
+    const local = v === meV && pred.on;
+    if (local) {
+      v.x = pred.x;
+      v.z = pred.z;
+    }
+    let da = (local ? pred.a : v.ta) - v.a;
     while (da > Math.PI) da -= Math.PI * 2;
     while (da < -Math.PI) da += Math.PI * 2;
     v.a += da * ka;
@@ -873,7 +949,7 @@ scene.onBeforeRenderObservable.add(() => {
 
     v.pulse = Math.max(0, v.pulse - dt * 5);
     const sq = 1 + 0.22 * v.pulse;
-    if (v.dashing) v.body.scaling.set(0.88, 0.88, 1.35);
+    if (v.dashing || (local && pred.dashT > 0)) v.body.scaling.set(0.88, 0.88, 1.35);
     else v.body.scaling.set(sq, 1 / sq, sq);
 
     tmpV.set(v.x, v.y + 1.95, v.z);
