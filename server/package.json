@@ -1,0 +1,17 @@
+{
+  "name": "rt-arena-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Authoritative multiplayer server for RT Arena (plain WebSocket, no framework)",
+  "main": "index.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
