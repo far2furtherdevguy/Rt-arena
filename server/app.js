@@ -61,7 +61,10 @@ class Room {
       id: p.id,
       code: this.code,
       priv: this.priv ? 1 : 0,
-      cfg: { r0: CFG.arenaR0, rmin: CFG.arenaRMin, pr: CFG.playerR, dashCd: CFG.dashCd, grace: CFG.grace },
+      cfg: {
+        r0: CFG.arenaR0, rmin: CFG.arenaRMin, pr: CFG.playerR, dashCd: CFG.dashCd, grace: CFG.grace,
+        acc: CFG.acc, friction: CFG.friction, dashSpeed: CFG.dashSpeed, dashTime: CFG.dashTime,
+      },
     });
     this.sendRoster();
   }
@@ -211,7 +214,7 @@ export function createApp(port = 0, host = '0.0.0.0') {
   let last = performance.now();
   let acc = 0;
   let sinceSnap = 1;
-  const SNAP_EVERY = 0.045; // ~20 snapshots/second saves mobile data and battery
+  const SNAP_EVERY = 0.03; // every tick (30/s): lowest latency; data use stays small
   const loop = setInterval(() => {
     const now = performance.now();
     const real = Math.min((now - last) / 1000, 0.25);
