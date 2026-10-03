@@ -1,0 +1,12 @@
+{
+  "appId": "com.rtarena.game",
+  "appName": "RT Arena",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false,
+    "backgroundColor": "#0b1020"
+  }
+}
