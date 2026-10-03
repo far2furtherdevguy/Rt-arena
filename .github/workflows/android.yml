@@ -1,0 +1,233 @@
+name: Build RT Arena APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Server tests never block the APK build.
+  test-server:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install and test
+        working-directory: server
+        run: |
+          npm install --no-audit --no-fund
+          npm test
+
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      VITE_SERVER_URL: ${{ vars.SERVER_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Check server address
+        run: |
+          if [ -z "$VITE_SERVER_URL" ]; then
+            echo "::warning::Repository variable SERVER_URL is not set. The app will ask for a server address in-game (tap 'Server')."
+          else
+            echo "Server address is set."
+          fi
+
+      - name: Install client dependencies
+        working-directory: client
+        run: |
+          for i in 1 2 3; do
+            npm install --no-audit --no-fund && exit 0
+            echo "npm install failed (attempt $i), retrying..."
+            sleep 5
+          done
+          exit 1
+
+      - name: Build web app
+        working-directory: client
+        run: npm run build
+
+      - name: Create Android project
+        working-directory: client
+        run: |
+          npx cap add android
+          npx cap sync android
+
+      - name: App icon, splash, landscape, fullscreen
+        continue-on-error: true
+        working-directory: client
+        run: |
+          python3 -m pip install --quiet pillow || python3 -m pip install --quiet --break-system-packages pillow
+          cat > /tmp/customize.py << 'PYEOF'
+          # Customises the generated Capacitor Android project: icon, splash, landscape, fullscreen.
+          # Every part is wrapped so a failure here can never break the build.
+          import os, re, sys, glob, traceback
+          from PIL import Image, ImageDraw
+
+          root = sys.argv[1]  # .../android/app/src/main
+          res = os.path.join(root, "res")
+          S = 1024
+
+          def lerp(a, b, t):
+              return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+          def background(size):
+              c1, c2 = (30, 27, 75), (15, 118, 110)
+              img = Image.new("RGB", (size, size))
+              px = img.load()
+              for y in range(size):
+                  for x in range(size):
+                      px[x, y] = lerp(c1, c2, (x + y) / (2.0 * (size - 1)))
+              return img
+
+          def glyph(size, scale):
+              """Arena platform with a glowing edge and a white ball being shoved off it."""
+              L = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+              d = ImageDraw.Draw(L)
+              cx, cy = size / 2, size / 2 + size * 0.05
+              w = size * scale
+              h = w * 0.46
+              # platform thickness (side)
+              d.ellipse([cx - w / 2, cy - h / 2 + w * 0.10, cx + w / 2, cy + h / 2 + w * 0.10], fill=(20, 34, 70, 255))
+              # glowing rim
+              d.ellipse([cx - w / 2 - w * 0.02, cy - h / 2 - w * 0.02, cx + w / 2 + w * 0.02, cy + h / 2 + w * 0.02], fill=(251, 146, 60, 255))
+              # top surface
+              d.ellipse([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], fill=(35, 55, 94, 255))
+              # ball (hanging over the edge, right side)
+              br = w * 0.20
+              bx, by = cx + w * 0.30, cy - h * 0.55
+              d.ellipse([bx - br, by - br, bx + br, by + br], fill=(255, 255, 255, 255))
+              d.ellipse([bx - br * 0.45, by - br * 0.75, bx + br * 0.25, by - br * 0.25], fill=(226, 232, 240, 255))
+              # motion streaks
+              for i, off in enumerate((0.0, 0.16, 0.32)):
+                  y = by + br * (0.5 - off * 2.2)
+                  d.rounded_rectangle([bx - br * 2.6 - i * br * 0.5, y - br * 0.07, bx - br * 1.25, y + br * 0.07], radius=int(br * 0.07), fill=(255, 255, 255, 170))
+              return L
+
+          def make_icons():
+              bg = background(S)
+              full = bg.convert("RGBA")
+              full.alpha_composite(glyph(S, 0.66))
+              m = Image.new("L", (S, S), 0)
+              ImageDraw.Draw(m).rounded_rectangle([0, 0, S - 1, S - 1], radius=int(S * 0.22), fill=255)
+              full.putalpha(m)
+              rnd = bg.convert("RGBA")
+              rnd.alpha_composite(glyph(S, 0.62))
+              cm = Image.new("L", (S, S), 0)
+              ImageDraw.Draw(cm).ellipse([0, 0, S - 1, S - 1], fill=255)
+              rnd.putalpha(cm)
+              fg = glyph(S, 0.50)
+              legacy = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+              adaptive = {"mdpi": 108, "hdpi": 162, "xhdpi": 216, "xxhdpi": 324, "xxxhdpi": 432}
+              for k, px in legacy.items():
+                  out = os.path.join(res, "mipmap-" + k)
+                  os.makedirs(out, exist_ok=True)
+                  full.resize((px, px), Image.LANCZOS).save(os.path.join(out, "ic_launcher.png"))
+                  rnd.resize((px, px), Image.LANCZOS).save(os.path.join(out, "ic_launcher_round.png"))
+              for k, px in adaptive.items():
+                  out = os.path.join(res, "mipmap-" + k)
+                  os.makedirs(out, exist_ok=True)
+                  fg.resize((px, px), Image.LANCZOS).save(os.path.join(out, "ic_launcher_foreground.png"))
+                  bg.resize((px, px), Image.LANCZOS).save(os.path.join(out, "ic_launcher_background.png"))
+              any_dir = os.path.join(res, "mipmap-anydpi-v26")
+              os.makedirs(any_dir, exist_ok=True)
+              xml = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                     '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                     '    <background android:drawable="@mipmap/ic_launcher_background"/>\n'
+                     '    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n'
+                     '</adaptive-icon>\n')
+              for n in ("ic_launcher.xml", "ic_launcher_round.xml"):
+                  open(os.path.join(any_dir, n), "w").write(xml)
+              return full
+
+          def make_splash(icon):
+              for path in glob.glob(os.path.join(res, "**", "splash*.png"), recursive=True):
+                  try:
+                      w, h = Image.open(path).size
+                      img = Image.new("RGB", (w, h), (11, 16, 32))
+                      side = int(min(w, h) * 0.34)
+                      ic = icon.resize((side, side), Image.LANCZOS)
+                      img.paste(ic, ((w - side) // 2, (h - side) // 2), ic)
+                      img.save(path)
+                  except Exception:
+                      traceback.print_exc()
+
+          def patch_manifest():
+              p = os.path.join(root, "AndroidManifest.xml")
+              s = open(p, encoding="utf-8").read()
+              if "screenOrientation" not in s:
+                  s = s.replace("<activity", '<activity android:screenOrientation="sensorLandscape"', 1)
+                  open(p, "w", encoding="utf-8").write(s)
+
+          def patch_styles():
+              p = os.path.join(res, "values", "styles.xml")
+              s = open(p, encoding="utf-8").read()
+              if "windowFullscreen" in s:
+                  return
+              extra = ('\n        <item name="android:windowFullscreen">true</item>'
+                       '\n        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>')
+              s2 = re.sub(r'(<style name="AppTheme\.NoActionBar"[^>]*>)', lambda m: m.group(1) + extra, s, count=1)
+              if s2 != s:
+                  open(p, "w", encoding="utf-8").write(s2)
+
+          icon = None
+          for step in (make_icons, patch_manifest, patch_styles):
+              try:
+                  r = step()
+                  if step is make_icons:
+                      icon = r
+              except Exception:
+                  traceback.print_exc()
+          if icon is not None:
+              try:
+                  make_splash(icon)
+                  icon.resize((512, 512), Image.LANCZOS).save("/tmp/rt_arena_icon_preview.png")
+              except Exception:
+                  traceback.print_exc()
+          print("customize done")
+          PYEOF
+          python3 /tmp/customize.py android/app/src/main
+
+      - name: Build APK
+        working-directory: client/android
+        run: |
+          chmod +x gradlew
+          for i in 1 2 3; do
+            ./gradlew assembleDebug --no-daemon --stacktrace && exit 0
+            echo "Gradle build attempt $i failed, retrying..."
+            sleep 10
+          done
+          exit 1
+
+      - name: Collect APK
+        run: |
+          mkdir -p out
+          cp client/android/app/build/outputs/apk/debug/app-debug.apk out/RT-Arena.apk
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RT-Arena-apk
+          path: out/RT-Arena.apk
+          retention-days: 30
